@@ -6,6 +6,8 @@ Source review: 2026-09-23. A fresh fetch confirmed Skein `main` at `bf991fde0013
 
 Skein's core can be delivered as an installable Pi extension without preserving ADK. The right unit to port is its task/evidence/execution layer, with Pi replacing ADK as the sole model and conversation runtime. A Python core preserves existing semantics; a thin TypeScript adapter connects it to Pi. The same adapter can be loaded by Pi's programmatic SDK for evaluations.
 
+The implemented design now separates three controls inside that package: PTC code mode, a general Pi observation trace, and the PTC model-facing contract. The general trace can observe Pi's native tools without PTC. The PTC task journal stays mandatory whenever PTC runs, because its effect and checkpoint recovery checks require durable events. Turning off both code mode and the general trace restores Pi's default tool and provider-facing prompt behavior. The executable comparison and implementation review are recorded in [docs/MODES_AND_PI_COMPARISON.md](docs/MODES_AND_PI_COMPARISON.md).
+
 The benchmark extension is useful contract evidence, but is not a substitute for porting the production harness. The PTC ADR explicitly identifies the parity scripts as evaluation adapters, not runtime architecture.
 
 ## ADRs reviewed

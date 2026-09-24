@@ -394,7 +394,11 @@ class SkeinRuntime:
             raise ValueError("workspace does not exist")
         if not 1 <= max_iterations <= 500 or not 1 <= max_verification_attempts <= 100:
             raise ValueError("invalid task budgets")
-        self.state_dir = Path(state_dir).resolve() / digest(task_id.encode())
+        self.state_root = Path(state_dir).resolve()
+        if self.state_root == self.workspace:
+            raise ValueError("state root must not be the workspace root")
+        self.state_root_inside_workspace = self.state_root.is_relative_to(self.workspace)
+        self.state_dir = self.state_root / digest(task_id.encode())
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.lock = (self.state_dir / "owner.lock").open("a+")
         try:
@@ -402,46 +406,55 @@ class SkeinRuntime:
         except BlockingIOError as error:
             self.lock.close()
             raise RuntimeError("task runtime is already owned by another process") from error
-        self.artifacts = self.state_dir / "artifacts"
-        self.artifacts.mkdir(exist_ok=True)
-        self.events = EventStore(self.state_dir)
-        if not self.events.events:
-            self.events.append("task.created", {"task_id": task_id, "goal": goal,
-                "criteria": criteria or [goal], "constraints": constraints or [],
-                "verification_requirements": verification_requirements or [],
-                "max_iterations": max_iterations,
-                "max_verification_attempts": max_verification_attempts}, "task-created")
-        else:
-            existing = reduce_ledger(self.events.events)
-            if existing is None or existing.task_id != task_id:
-                raise ValueError("task identity mismatch")
-        self.worker = PersistentPythonWorker(max_output_bytes=51200, state_recovery="snapshot", capture_committed=True)
-        self.broker = LocalBroker(self)
-        self.checkpoint_path = self.state_dir / "checkpoint.json"
-        if self.checkpoint_path.exists():
-            checkpoint = json.loads(self.checkpoint_path.read_text())
-            if checkpoint["event_sequence"] > len(self.events.events):
-                raise ValueError("checkpoint refers to missing events")
-            prefix = self.events.events[:checkpoint["event_sequence"]]
-            if checkpoint.get("event_stream_hash") != self.events_hash(prefix):
-                raise ValueError("checkpoint event stream integrity failure")
-            if not any(event["kind"] == "checkpoint.created"
-                       and event["payload"].get("cell_id") == checkpoint["cell_id"]
-                       for event in self.events.events[checkpoint["event_sequence"]:]):
-                raise ValueError("checkpoint publication marker is missing")
-            if checkpoint.get("workspace_revision") != self.snapshot_hash(self.snapshot()):
-                raise ValueError("checkpoint workspace revision differs from current workspace")
-            self.worker.restore_plain(checkpoint["values"], checkpoint["cell_id"])
+        try:
+            self.artifacts = self.state_dir / "artifacts"
+            self.artifacts.mkdir(exist_ok=True)
+            self.events = EventStore(self.state_dir)
+            if not self.events.events:
+                self.events.append("task.created", {"task_id": task_id, "goal": goal,
+                    "criteria": criteria or [goal], "constraints": constraints or [],
+                    "verification_requirements": verification_requirements or [],
+                    "max_iterations": max_iterations,
+                    "max_verification_attempts": max_verification_attempts}, "task-created")
+            else:
+                existing = reduce_ledger(self.events.events)
+                if existing is None or existing.task_id != task_id:
+                    raise ValueError("task identity mismatch")
+            self.worker = PersistentPythonWorker(max_output_bytes=51200, state_recovery="snapshot", capture_committed=True)
+            self.broker = LocalBroker(self)
+            self.checkpoint_path = self.state_dir / "checkpoint.json"
+            if self.checkpoint_path.exists():
+                checkpoint = json.loads(self.checkpoint_path.read_text())
+                if checkpoint["event_sequence"] > len(self.events.events):
+                    raise ValueError("checkpoint refers to missing events")
+                prefix = self.events.events[:checkpoint["event_sequence"]]
+                if checkpoint.get("event_stream_hash") != self.events_hash(prefix):
+                    raise ValueError("checkpoint event stream integrity failure")
+                if not any(event["kind"] == "checkpoint.created"
+                           and event["payload"].get("cell_id") == checkpoint["cell_id"]
+                           for event in self.events.events[checkpoint["event_sequence"]:]):
+                    raise ValueError("checkpoint publication marker is missing")
+                if checkpoint.get("workspace_revision") != self.snapshot_hash(self.snapshot()):
+                    raise ValueError("checkpoint workspace revision differs from current workspace")
+                self.worker.restore_plain(checkpoint["values"], checkpoint["cell_id"])
+        except BaseException:
+            if hasattr(self, "worker"):
+                self.worker.close()
+            fcntl.flock(self.lock.fileno(), fcntl.LOCK_UN)
+            self.lock.close()
+            raise
 
     def snapshot(self) -> dict[str, str]:
         result = {}
         for root, directories, files in os.walk(self.workspace):
             base = Path(root)
             directories[:] = [name for name in directories if name != ".git"
-                              and not (base / name).resolve().is_relative_to(self.state_dir)]
+                              and not (self.state_root_inside_workspace
+                                       and (base / name).resolve().is_relative_to(self.state_root))]
             for name in files:
                 path = base / name
-                if path.is_symlink() or path.resolve().is_relative_to(self.state_dir):
+                if path.is_symlink() or (self.state_root_inside_workspace
+                                         and path.resolve().is_relative_to(self.state_root)):
                     continue
                 try:
                     result[str(path.relative_to(self.workspace))] = digest(path.read_bytes())

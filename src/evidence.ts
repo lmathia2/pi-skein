@@ -12,6 +12,41 @@ export interface SkeinEvidence {
 	unresolvedEffects: string[];
 }
 
+export interface PiTraceEvent {
+	schema_version: number;
+	sequence: number;
+	event_id: string;
+	timestamp: string;
+	kind: string;
+	payload: Record<string, unknown>;
+}
+
+export function getPiTracePath(stateDir: string, sessionId: string): string {
+	const name = createHash("sha256").update(sessionId).digest("hex");
+	return join(stateDir, "pi-trace", name, "events.jsonl");
+}
+
+export function readPiTrace(stateDir: string, sessionId: string): { path: string; events: PiTraceEvent[] } {
+	const path = getPiTracePath(stateDir, sessionId);
+	const events = readFileSync(path, "utf8").split("\n").filter(Boolean)
+		.map((line) => JSON.parse(line) as PiTraceEvent);
+	for (let index = 0; index < events.length; index++) {
+		if (events[index].schema_version !== 1 || events[index].sequence !== index + 1) {
+			throw new Error("Pi trace has an invalid schema or sequence gap");
+		}
+	}
+	return { path, events };
+}
+
+export function readPiTraceArtifact(stateDir: string, sessionId: string, uri: string): unknown {
+	const sha = uri.startsWith("artifact://sha256/") ? uri.slice("artifact://sha256/".length) : "";
+	if (!/^[a-f0-9]{64}$/.test(sha)) throw new Error("Invalid Pi trace artifact URI");
+	const directory = join(stateDir, "pi-trace", createHash("sha256").update(sessionId).digest("hex"), "artifacts");
+	const body = readFileSync(join(directory, sha), "utf8");
+	if (createHash("sha256").update(body).digest("hex") !== sha) throw new Error("Pi trace artifact integrity failure");
+	return JSON.parse(body) as unknown;
+}
+
 export function getSkeinTaskPointer(branch: readonly { type: string; customType?: string; data?: unknown }[]): SkeinTaskPointer | null {
 	const entry = [...branch].reverse().find((item) => item.type === "custom" && item.customType === "pi-skein-task");
 	if (!entry || !entry.data || typeof entry.data !== "object") return null;

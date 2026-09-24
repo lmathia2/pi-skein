@@ -6,7 +6,7 @@ import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { createSkeinExtension } from "../src/index.ts";
-import { getSkeinTaskPointer, readSkeinEvidence } from "../src/evidence.ts";
+import { getSkeinTaskPointer, readSkeinEvidence, readPiTrace } from "../src/evidence.ts";
 
 const workspace = mkdtempSync(join(tmpdir(), "pi-skein-faux-"));
 const stateDir = join(workspace, "skein-state");
@@ -60,6 +60,11 @@ try {
   if (!pointer) throw new Error("missing Skein task pointer");
   const evidence = readSkeinEvidence(stateDir, pointer.taskId);
   const events = readFileSync(evidence.tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const piEvents = readPiTrace(stateDir, session.sessionManager.getSessionId()).events;
+  if (!piEvents.some((event) => event.kind === "pi.context_prepared") ||
+      (!failing && !piEvents.some((event) => event.kind === "pi.tool_completed" && event.payload.tool_name === "code"))) {
+    throw new Error("Pi observation trace did not capture the model context and code result");
+  }
   if (!events.some((event) => event.kind === "pi.context_prepared") ||
       (!failing && !events.some((event) => event.kind === "result.retained"))) {
     throw new Error("Pi model context was not linked to the durable Skein trace");

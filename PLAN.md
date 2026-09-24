@@ -4,11 +4,11 @@ Written 2026-09-23. Implementation started on 2026-09-23. [README.md](README.md)
 
 The current-source and ADR assessment is in [PORTABILITY.md](PORTABILITY.md), including implementation gaps and public Pi API compatibility boundaries.
 
-Current implementation: one installable Pi package, copied persistent worker and v4.1 text-result projection, local broker, append-only task events, reduced task ledger, artifacts, notebook projection and materialized `.ipynb`, plain checkpoints with event/workspace integrity checks, Pi `code` tool and user-shell routing, Pi session pointers, static v4.1 Pi tool prompt, context/tool projection evidence, retained read references, host verification, and offline evidence inspection. The dynamic Markdown packet is opt-in; the default preserves Pi's native message context as in the measured v4.1 adapter. Python tests, Pi package loading, Pi SDK tool execution, typechecking, a packed temporary Pi installation, and a complete faux-provider Pi run have passed. The remaining phases below are still planned; in particular complete context selection, scope/evidence-strength verification, approvals, full analytical ledger semantics, and strict provider-budget admission are not complete.
+Current implementation: one installable Pi package with independently switchable PTC code mode, Pi observation trace, and model-facing PTC contract. The Python PTC task journal remains mandatory when code mode runs; the optional Pi trace observes native/model tool calls and model context without taking over execution. With code and Pi trace off, Pi's default tools and provider-facing system sections are preserved. The package also includes the persistent worker and v4.1 result projection, broker, reduced task ledger, artifacts, materialized notebook, plain checkpoints, host verification, and offline evidence readers. The dynamic Markdown packet is opt-in. The executable mode matrix and default-Pi review are in [docs/MODES_AND_PI_COMPARISON.md](docs/MODES_AND_PI_COMPARISON.md). The remaining phases below are still planned; in particular complete context selection, scope/evidence-strength verification, approvals, full analytical ledger semantics, and strict provider-budget admission are not complete.
 
 ## Goal and recommendation
 
-Make `pi-skein` a self-contained, ADK-free extension installed into Pi. Use the same extension in Pi's TUI and in Pi SDK sessions for programmatic evaluations. Both use the same task controller, durable append-only trace, reduced task ledger, notebook, broker, recovery, and host verification. Pi owns model calls, provider authentication, native tool continuation, conversation history, streaming, compaction, and the user interface.
+Make `pi-skein` a self-contained, ADK-free extension installed into Pi. Use the same extension in Pi's TUI and in Pi SDK sessions for programmatic evaluations. PTC code mode uses the task controller, mandatory append-only task journal, reduced task ledger, notebook, broker, recovery, and host verification. A separate optional Pi observation trace captures native tool execution and model-facing context even when PTC is off. Pi owns model calls, provider authentication, native tool continuation, conversation history, streaming, compaction, and the user interface.
 
 Use a TypeScript extension plus a supervised Python runtime process. Preserve the Python cell language and existing worker semantics first. Do not rewrite PTC in JavaScript or embed the ADK agent loop inside Pi. Extract the necessary runtime into this repository so an installed package does not depend on sibling source checkouts.
 
@@ -42,6 +42,7 @@ Pi's coding-agent package declares version `0.87.1`. Treat the inspected commit 
 | Persistent Python cells and helper contract | Python runtime extracted from `harness/ptc/` |
 | Filesystem, shell, receipts, workspace checks | Python broker extracted from `harness/execution/` |
 | Durable task events and causal trace | Core append-only event store; Pi lifecycle adapter records model/session observations |
+| Pi-native execution/model observation | Optional separate append-only Pi trace; no PTC worker or task ledger needed |
 | Reduced `TaskLedger`, progress, budgets, steering | Core deterministic reducers and task controller shared by both entry points |
 | Analytical `LedgerStore` | Rebuildable query projection over canonical events, with optional indexed backends |
 | Notebook, artifacts, output/context projections | Core durable workbench and content-addressed storage |
@@ -62,18 +63,21 @@ Pi TUI                       Pi SDK evaluation session
        +------------+------------+
                     |
           Installed pi-skein extension (TypeScript)
-          tool registration, lifecycle, context, continuation
-                    |
-          Versioned private stdio protocol
-                    |
-          Bundled extension runtime (Python)
+          mode controller + PTC contract + optional Pi observer
+                    +--> Pi native tools (code off)
+                    +--> Pi observation JSONL/artifacts (trace on)
+                    +--> Versioned private stdio protocol (code on)
+                              |
+                    Bundled extension runtime (Python)
           task controller + deterministic TaskLedger reducer
           append-only events + analytical ledger projection
           notebook + artifacts + checkpoints + bounded projections
           broker + verifier + PersistentPythonWorker
 ```
 
-The Python core is the sole task-policy authority. The TypeScript adapter requests decisions and translates them into Pi operations; the TUI and SDK do not implement separate completion, budget, or recovery logic.
+The Python core is the sole PTC task-policy authority. The TypeScript mode controller only selects tools and model-facing instructions; the Pi observer only records Pi activity. Neither can declare a PTC task complete. The TUI and SDK do not implement separate completion, budget, or recovery logic.
+
+The mode boundaries are intentional: code off restores Pi's prior tools (or its default `read`, `bash`, `edit`, `write` set); Pi trace off stops general Pi observation but cannot disable the PTC journal needed for checkpoint and uncertain-effect safety; contract off removes v4.1 tool guidance, optional packet, and optional review while preserving a minimal usable `code` description. Contract has no model-facing effect with code off. Code and Pi trace both off leave Pi's default tool and prompt behavior intact. Pi's explicit `--tools code` allowlist prevents restoration of built-ins; start Pi without that allowlist for runtime switching.
 
 ### Programmatic evaluation surface
 

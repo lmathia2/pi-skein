@@ -218,6 +218,24 @@ class RuntimeIntegrationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "workspace revision"):
                 SkeinRuntime(str(workspace), str(root / "state"), "task-4")
 
+    def test_pi_trace_inside_state_root_does_not_invalidate_ptc_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            state_root = workspace / ".skein-state"
+            runtime = SkeinRuntime(str(workspace), str(state_root), "task-with-pi-trace", "Compute")
+            try:
+                self.assertEqual(runtime.execute("value = 5", "cell-1")["status"], "ok")
+            finally:
+                runtime.close()
+            trace_dir = state_root / "pi-trace" / "sample"
+            trace_dir.mkdir(parents=True)
+            (trace_dir / "events.jsonl").write_text('{"sequence":1}\n')
+            reopened = SkeinRuntime(str(workspace), str(state_root), "task-with-pi-trace")
+            try:
+                self.assertEqual(reopened.execute("print(value)", "cell-2")["text"], "5\n")
+            finally:
+                reopened.close()
+
     def test_provider_error_is_terminal_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
