@@ -1,0 +1,24 @@
+{
+  "name": "pi-skein",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Skein task evidence and persistent Python for Pi",
+  "keywords": ["pi-package"],
+  "pi": {"extensions": ["./src/index.ts"]},
+  "exports": {"./extension": "./src/index.ts", "./evidence": "./src/evidence.ts"},
+  "files": ["src", "python/pi_skein", "python/pyproject.toml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "!**/__pycache__", "!**/*.pyc"],
+  "engines": {"node": ">=22.19.0"},
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "22.19.19",
+    "typebox": "1.3.27",
+    "typescript": "5.9.3"
+  },
+  "scripts": {"check": "tsc --noEmit"}
+}

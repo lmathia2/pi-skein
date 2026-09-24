@@ -1,0 +1,1558 @@
+"""A small persistent CPython worker.
+
+The child owns only the Python namespace. All intended workspace effects cross the
+pipe and are performed by the parent-owned broker. The source guard is deliberately
+defense-in-depth, not a security sandbox. The supported boundary is a trusted local
+workspace; OS isolation is an optional outer deployment concern.
+"""
+
+from __future__ import annotations
+
+import ast
+import builtins
+import hashlib
+import importlib
+import io
+import json
+import math
+import multiprocessing
+import pickle
+import platform
+import queue
+import threading
+import time
+import traceback
+from collections import deque
+from collections.abc import Callable, Mapping
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
+from itertools import islice
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
+from types import SimpleNamespace
+from typing import Any, Literal, Protocol
+from uuid import uuid4
+
+
+class ReplBroker(Protocol):
+    """Parent-side operations exposed to programs through ``agent``."""
+
+    def read(self, path: str, offset: int = 1, limit: int = 400) -> Any: ...
+
+    def write(
+        self,
+        path: str,
+        content: str,
+        expected_sha256: str | None = None,
+        expected_absent: bool = False,
+    ) -> Any: ...
+
+    def edit(
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        expected_sha256: str | None = None,
+    ) -> Any: ...
+
+    def bash(self, command: str, timeout_seconds: int = 120) -> Any: ...
+
+    def verify(self, command: str, timeout_seconds: int = 120) -> Any: ...
+
+    def call(self, capability: str, arguments: dict[str, Any]) -> Any: ...
+
+    def parallel(self, operations: list[dict[str, Any]]) -> Any: ...
+
+    def artifacts_load(self, uri: str, offset: int = 0, limit: int = 16_000) -> Any: ...
+
+    def artifacts_list(self) -> Any: ...
+
+    def artifacts_publish(
+        self, value: Any, name: str, description: str | None = None
+    ) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PythonExecutionResult:
+    status: Literal["ok", "error", "timeout"]
+    stdout: str = ""
+    stderr: str = ""
+    full_stdout: str | None = None
+    full_stderr: str | None = None
+    value_repr: str | None = None
+    full_value_repr: str | None = None
+    display_data: dict[str, Any] | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    failure_stage: Literal["parse", "source_validation", "execution", "transport"] | None = None
+    error_line: int | None = None
+    error_source: str | None = None
+    traceback: tuple[str, ...] = ()
+    duration_ms: int = 0
+    effect_unknown: bool = False
+    output_truncated: bool = False
+    state_count: int = 0
+    state_delta: tuple[str, ...] = ()
+    state_deleted: tuple[str, ...] = ()
+    state_manifest: tuple[dict[str, Any], ...] = ()
+    retained_read_uses: tuple[str, ...] = ()
+    state_preserved: bool = False
+    checkpoint_values: dict[str, Any] | None = None
+    checkpoint_omitted_names: tuple[str, ...] = ()
+
+
+class _BoundedText(io.TextIOBase):
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._parts: list[str] = []
+        self._full_parts: list[str] = []
+        self._size = 0
+        self._full_size = 0
+        self._original_size = 0
+        self.truncated = False
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        text = str(value)
+        encoded = text.encode('utf-8')
+        retained = encoded[:max(256_000 - self._original_size, 0)].decode('utf-8', errors='ignore')
+        self._original_size += len(encoded)
+        if retained:
+            self._full_parts.append(retained)
+        self._full_size += len(retained.encode())
+        remaining = self._limit - self._size
+        if remaining > 0:
+            kept = text.encode("utf-8")[:remaining].decode("utf-8", errors="ignore")
+            self._parts.append(kept)
+            self._size += len(kept.encode("utf-8"))
+        if len(text.encode("utf-8")) > remaining:
+            self.truncated = True
+        return len(text)
+
+    def getvalue(self) -> str:
+        return "".join(self._parts)
+
+    def full_value(self) -> str | None:
+        if not self.truncated:
+            return None
+        text = "".join(self._full_parts)
+        if self._original_size > self._full_size:
+            text += f"\n[retention truncated: original {self._original_size} bytes; suffix unavailable]"
+        return text
+
+
+_BLOCKED_MODULES = frozenset(
+    {
+        "asyncio",
+        "builtins",
+        "ctypes",
+        "ftplib",
+        "http",
+        "importlib",
+        "io",
+        "multiprocessing",
+        "os",
+        "pathlib",
+        "requests",
+        "shutil",
+        "signal",
+        "socket",
+        "subprocess",
+        "sys",
+        "telnetlib",
+        "urllib",
+    }
+)
+_BLOCKED_CALLS = frozenset(
+    {
+        "__import__",
+        "breakpoint",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
+)
+
+
+def _validate_source(tree: ast.AST) -> None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            error = PermissionError("dunder namespace access is blocked")
+            error.lineno = node.lineno  # type: ignore[attr-defined]
+            raise error
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            error = PermissionError("dunder attribute access is blocked")
+            error.lineno = node.lineno  # type: ignore[attr-defined]
+            raise error
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [item.name for item in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            for name in names:
+                if name.split(".", 1)[0] in _BLOCKED_MODULES:
+                    error = PermissionError(
+                        f"direct import of {name!r} is blocked; use agent capabilities"
+                    )
+                    error.lineno = node.lineno  # type: ignore[attr-defined]
+                    raise error
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _BLOCKED_CALLS
+        ):
+            error = PermissionError(
+                f"direct call to {node.func.id!r} is blocked; use agent capabilities"
+            )
+            error.lineno = node.lineno  # type: ignore[attr-defined]
+            raise error
+
+
+def _safe_builtins() -> dict[str, Any]:
+    allowed = dict(vars(builtins))
+    for name in _BLOCKED_CALLS:
+        allowed.pop(name, None)
+
+    original_import = builtins.__import__
+
+    def guarded_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name.split(".", 1)[0] in _BLOCKED_MODULES:
+            raise PermissionError(f"direct import of {name!r} is blocked; use agent capabilities")
+        return original_import(name, *args, **kwargs)
+
+    allowed["__import__"] = guarded_import
+    return allowed
+
+
+class _RemoteOperation:
+    def __init__(self, connection: Connection, operation: str, state: _StateProxy | None = None) -> None:
+        self._connection = connection
+        self._operation = operation
+        self._state = state
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        request_id = uuid4().hex
+        self._connection.send(
+            {
+                "type": "broker_call",
+                "id": request_id,
+                "operation": self._operation,
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
+        response = self._connection.recv()
+        if response.get("type") != "broker_result" or response.get("id") != request_id:
+            raise RuntimeError("invalid broker response")
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error", "broker call failed")))
+        result = response.get("result")
+        if self._state is not None:
+            for item in result if self._operation == "parallel" and type(result) is list else [result]:
+                self._state.register_read(item)
+        return result
+
+
+class _DirectResult(str):
+    """Readable direct-helper result with the old mapping contract preserved."""
+
+    def __new__(cls, text: str, raw: Mapping[str, Any]):
+        value = super().__new__(cls, text)
+        value.raw = raw
+        return value
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.raw[key] if isinstance(key, str) else super().__getitem__(key)
+
+    def __reduce__(self):
+        return type(self), (str(self), self.raw)
+
+    def __getattr__(self, name: str) -> Any:
+        data = self.raw.get("data", {})
+        if name in data:
+            return data[name]
+        if name in self.raw:
+            return self.raw[name]
+        raise AttributeError(name)
+
+
+class _DirectOperation(_RemoteOperation):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        result = super().__call__(*args, **kwargs)
+        if not isinstance(result, Mapping):
+            return result
+        data = result.get("data", {})
+        if self._operation == "fs.read":
+            text = str(data.get("text", ""))
+        elif self._operation in {"shell.run", "verify"}:
+            text = str(data.get("output") or (
+                str(data.get("stdout", ""))
+                + ("\n[stderr]\n" + str(data["stderr"]) if data.get("stderr") else "")
+                + f'\n[exit {data.get("exit_code")}]'
+            ))
+        else:
+            text = (f'{self._operation.rsplit(".", 1)[-1]}: {data.get("path", "")} — '
+                    f'{"changed" if data.get("changed") else "no change"}')
+        value = _DirectResult(text, result)
+        if self._operation == "verify" and result.get("status") != "ok":
+            raise AssertionError(value)
+        return value
+
+
+_PRELOADED_MODULES = ("json", "math", "re")
+_DIRECT_TOOL_NAMES = ("read", "write", "edit", "bash", "verify")
+_RESERVED_NAMES = frozenset({"agent", *_PRELOADED_MODULES, *_DIRECT_TOOL_NAMES})
+_MAX_HELP_BYTES = 16_000
+
+WORKSPACE_EXECUTION_GUIDANCE = """The PTC worker is a computation environment, not the workspace interpreter;
+workspace modules and project dependencies are not implicitly importable here.
+Parse captured data and write explicit calculations in the worker; do not exec/eval/compile
+retrieved source. Required project execution goes through agent.shell.run under its
+configured policy. Build generated command arguments with shlex.join([...]), not nested
+manual escaping. Check status and model_text on rejection: a blocked command did not run.
+Do not bypass a denial with worker imports, or substitute a reconstructed calculation
+when the task requires actual project execution. A calculation is not independent verification."""
+
+# JSON is preloaded. This example decodes only one complete UTF-8 artifact page;
+# it does not turn a partially captured source into a whole-file observation.
+READ_RESULT_RECIPE = """saved_result = source_text = None
+if page.get('status') == 'ok':
+    data = page['data']
+    if data['offset'] == 0 and data['complete'] and data['encoding'] == 'utf-8':
+        saved = json.loads(data['text'])
+        if isinstance(saved, dict) and saved.get('status') == 'ok':
+            saved_result, source_text = saved, saved['data']['text']"""
+_AGENT_HELP = {
+    "fs.read": "agent.fs.read(path, offset=1, limit=400)",
+    "fs.write": ("agent.fs.write(path, content, expected_sha256=None, expected_absent=False)"),
+    "fs.edit": "agent.fs.edit(path, old_text, new_text, expected_sha256=None)",
+    "shell.run": "agent.shell.run(command, timeout_seconds=120)",
+    "mcp.call": "agent.mcp.call(capability, arguments)",
+    "parallel": "agent.parallel([{'operation': 'fs.read', 'arguments': {...}}, ...])",
+    "state.list": "agent.state.list()",
+    "state.reads": "agent.state.reads(path=None)",
+    "state.reuse": "agent.state.reuse(handle_or_artifact_uri)",
+    "state.cite": "agent.state.cite(handle_or_artifact_uri)",
+    "state.describe": "agent.state.describe(name, selector=(), preview=False)",
+    "state.annotate": "agent.state.annotate(name, description, selector=())",
+    "artifacts.load": "agent.artifacts.load(uri, offset=0, limit=16000)",
+    "artifacts.list": "agent.artifacts.list()",
+    "artifacts.publish": "agent.artifacts.publish(value, name, description=None)",
+}
+
+_AGENT_RESULTS: dict[str, dict[str, object]] = {
+    "fs.read": {
+        "status": "ok|error|blocked",
+        "data": {
+            "path": "str",
+            "text": "str (exact redacted selected range)",
+            "offset": "int",
+            "returned_lines": "int",
+            "total_lines": "int",
+            "complete": "bool",
+            "next_offset": "int|null",
+            "sha256": "str (original content identity)",
+        },
+        "read_reference": {
+            "artifact_uri": "str (completed read receipt; cite this exact value, not data.sha256)",
+            "task_id": "str", "operation_id": "str", "path": "str", "sha256": "str",
+            "offset": "int", "returned_lines": "int",
+            "source_coverage": {"whole_file": "bool|null", "total_lines": "int|null",
+                                "next_unread_offset": "int|null"},
+        },
+        "read_handle": "read:N (live-worker shorthand; resolve with agent.state.cite)",
+        "read_reuse": {
+            "scope": "present when current-version catalog coverage was used",
+            "reused_lines": "int", "source_read_lines": "int",
+            "identity_probe_lines": "int", "reused_ranges": "inclusive line ranges",
+            "source_read_ranges": "inclusive line ranges",
+        },
+    },
+    "shell.run": {
+        "result_kind": "process|managed (route, not proof of execution or success)",
+        "status": "ok|error|blocked|timeout",
+        "exit_code": "int|null (process result only; absent for managed CLI views)",
+        "data": {"stdout": "str (process only)", "stderr": "str (process only)"},
+        "truncated": "bool",
+        "artifact_uri": "str|null",
+        "managed_cli": {
+            "data": "native managed-command payload, not process stdout/stderr",
+            "model_text": "bounded rendering of the native payload",
+            "memory_query": "result['data'] is the view envelope; result['data']['data'] is its body",
+            "memory_note": "Check result['status'] and result['data']['status']. Writes return a compact receipt in data (event_id, committed version, payload_hash, entry_count, recovery), not text/entries. note read returns full latest text/entries in data. No exit_code or stdout, no json.loads needed; a write receipt is not verification of findings.",
+            "read_recover": "body['text'], body['read_evidence'], body['source_coverage']; historical capture only",
+        },
+    },
+    "state.describe": {
+        "shape": "descriptor mapping directly, without a status/data envelope",
+        "name": "str", "type": "str", "preview": "optional bounded display, not full content",
+        "read_reference": "optional broker-established historical source reference",
+        "unavailable": "raises KeyError for an unavailable binding/selector; inspect state.list or catch KeyError",
+    },
+    "state.reads": {
+        "shape": "bounded list of broker-attested reads retained in the live worker epoch",
+        "scope": "historical captured ranges; entries are not current-freshness claims",
+        "content_expression": "exact executable expression for the retained source text",
+    },
+    "state.reuse": {
+        "shape": "original successful fs.read result mapping retained in the live worker epoch",
+        "argument": "compact handle from state.reads, or an exact completed fs.read artifact_uri",
+        "unavailable": "raises KeyError after worker loss, eviction, or in-place mutation",
+    },
+    "state.cite": {
+        "shape": "exact completed fs.read artifact URI for a live retained read",
+        "argument": "compact read:N handle from the read result or state.reads",
+        "use": "put the returned URI in a source-dependent finding's evidence_refs",
+        "unavailable": "raises KeyError after worker loss, eviction, or in-place mutation",
+    },
+    "fs.write": {"status": "ok|error|blocked", "data": {"path": "str", "sha256": "broker-attested after-SHA256"},
+                 "content_hashes": "{path: same after-SHA256}; use result['data']['sha256'] for next expected_sha256"},
+    "fs.edit": {"status": "ok|error|blocked", "data": {"path": "str", "sha256": "broker-attested after-SHA256"},
+                "content_hashes": "{path: same after-SHA256}; use result['data']['sha256'] for next expected_sha256"},
+    "artifacts.load": {
+        "status": "ok|error|blocked",
+        "data": {"uri": "str", "encoding": "utf-8|base64",
+                 "text": "str for exact UTF-8, null otherwise",
+                 "base64": "present only for non-UTF-8 byte pages; decode with base64.b64decode",
+                 "offset": "zero-based byte offset", "returned_bytes": "int", "total_bytes": "int",
+                 "complete": "bool (end of artifact, not whole coverage if offset > 0)",
+                 "next_offset": "next byte offset or null"},
+        "recovery": "Combine exact page bytes before UTF-8/JSON parsing. A completed fs.read artifact is a saved result envelope: check its status, then data.text and source metadata. Historical only.",
+        "completed_read_recipe": READ_RESULT_RECIPE,
+        "recipe_contract": "Assign page = agent.artifacts.load(uri). page.data.text contains JSON bytes, NOT source text. Run the recipe in the same cell; select only task-relevant source fields. source_text=None means decoding was not established: handle non-ok status first; otherwise finish exact byte paging, including base64 decoding where needed. saved_result retains original source coverage; decoding never establishes current freshness.",
+        "rejection": "Invalid arguments or denied access return error/blocked with effect=none. Recover exact authorized URIs via agent.artifacts.list(); never guess hashes. Corruption or unknown effects still require fail-closed handling.",
+    },
+    "artifacts.list": {"data": {"artifacts": "list of task-authorized uri entries; published entries also carry name/description"}},
+    "mcp.call": {"status": "capability-defined result mapping"},
+    "parallel": {"status": "list[result] in input order", "allowed": ["fs.read"]},
+}
+
+
+def _agent_help(
+    catalog: Mapping[str, Mapping[str, object]],
+    prefix: str | None = None,
+    *,
+    details: bool = False,
+) -> dict[str, object]:
+    """Return bounded, deterministic capability signatures."""
+
+    if prefix is not None and not isinstance(prefix, str):
+        raise TypeError("help prefix must be a string or None")
+    selected = {
+        name: item
+        for name, item in sorted(catalog.items())
+        if prefix is None or name.startswith(prefix)
+    }
+    compact: dict[str, object] = {
+        name: str(item.get("signature", item.get("description", "")))
+        for name, item in selected.items()
+    }
+    candidate: dict[str, object] = (
+        {name: dict(item) for name, item in selected.items()} if details else compact
+    )
+    if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) <= _MAX_HELP_BYTES:
+        return candidate
+    notice = (
+        f"Help exceeded {_MAX_HELP_BYTES} bytes; "
+        "call agent.help('exact.name', details=True)."
+    )
+    degraded: dict[str, object] = {"_notice": notice, **compact}
+    if len(json.dumps(degraded, sort_keys=True, separators=(",", ":")).encode()) <= _MAX_HELP_BYTES:
+        return degraded
+    names: list[str] = []
+    pointer: dict[str, object] = {"_notice": notice, "matches": names}
+    for name in selected:
+        names.append(name)
+        if len(json.dumps(pointer, sort_keys=True, separators=(",", ":")).encode()) > _MAX_HELP_BYTES:
+            names.pop()
+            break
+    return pointer
+
+
+def _binding_description(
+    name: str,
+    value: Any,
+    metadata: Mapping[str, Mapping[str, str]],
+) -> dict[str, Any]:
+    value_type = type(value)
+    normal_type = type(value_type) is type
+    item: dict[str, Any] = {
+        "name": name,
+        "type": value_type.__name__ if normal_type else "object",
+        "module": value_type.__module__ if normal_type and type(value_type.__module__) is str else "unknown",
+        "cell_id": metadata.get(name, {}).get("cell_id", "unknown"),
+        "replay": metadata.get(name, {}).get("replay", "transient"),
+    }
+    if any(value_type is known for known in (str, bytes, list, tuple, dict, set, frozenset)):
+        item["size"] = len(value)
+    return item
+
+
+def _state_manifest(
+    namespace: Mapping[str, Any],
+    metadata: Mapping[str, Mapping[str, str]],
+) -> list[dict[str, Any]]:
+    return [
+        _binding_description(name, namespace[name], metadata)
+        for name in sorted(namespace)
+        if not name.startswith("__") and name not in _RESERVED_NAMES
+    ]
+
+
+def _snapshot_value(value: Any, seen: set[int], depth: int = 0) -> bool:
+    if type(value) in {type(None), bool, int, float, str, bytes}:
+        return True
+    if type(value) is _DirectResult:
+        return _snapshot_value(value.raw, seen, depth + 1)
+    if depth >= 20 or type(value) not in {list, tuple, dict, set, frozenset}:
+        return False
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    values = value.items() if type(value) is dict else value
+    if type(value) is dict:
+        valid = all(
+            _snapshot_value(key, seen, depth + 1) and _snapshot_value(item, seen, depth + 1)
+            for key, item in values
+        )
+    else:
+        valid = all(_snapshot_value(item, seen, depth + 1) for item in values)
+    seen.remove(identity)
+    return valid
+
+
+def _checkpoint_value(value: Any, seen: set[int], depth: int = 0) -> bool:
+    """Only exact JSON-safe plain data may cross a durable worker checkpoint."""
+    if type(value) in {type(None), bool, int, str}:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if depth >= 20 or type(value) not in {list, dict}:
+        return False
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    valid = (all(type(key) is str and _checkpoint_value(item, seen, depth + 1)
+                 for key, item in value.items()) if type(value) is dict else
+             all(_checkpoint_value(item, seen, depth + 1) for item in value))
+    seen.remove(identity)
+    return valid
+
+
+def _plain_checkpoint(namespace: Mapping[str, Any], max_bytes: int) -> tuple[dict[str, Any], tuple[str, ...]]:
+    selected: dict[str, Any] = {}
+    omitted: list[str] = []
+    for name in sorted(namespace):
+        if name.startswith("__") or name in _RESERVED_NAMES:
+            continue
+        value = namespace[name]
+        if not _checkpoint_value(value, set()):
+            omitted.append(name)
+            continue
+        # ponytail: candidate serialization is O(names * snapshot size); upgrade only if measured hot.
+        try:
+            candidate = json.dumps({**selected, name: value}, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False, allow_nan=False).encode()
+        except (TypeError, ValueError, OverflowError):
+            omitted.append(name)
+            continue
+        if len(candidate) > max_bytes:
+            omitted.append(name)
+        else:
+            selected[name] = value
+    return selected, tuple(omitted)
+
+
+def _snapshot_namespace(namespace: Mapping[str, Any], max_bytes: int) -> bytes:
+    selected: dict[str, Any] = {}
+    for name in sorted(namespace):
+        if name.startswith("__") or name in _RESERVED_NAMES:
+            continue
+        value = namespace[name]
+        if not _snapshot_value(value, set()):
+            continue
+        candidate = pickle.dumps({**selected, name: value}, protocol=5)
+        if len(candidate) <= max_bytes:
+            selected[name] = value
+    return pickle.dumps(selected, protocol=5)
+
+
+def _restore_snapshot(namespace: dict[str, Any], snapshot: bytes) -> None:
+    for name in tuple(namespace):
+        if not name.startswith("__") and name not in _RESERVED_NAMES:
+            del namespace[name]
+    namespace.update(pickle.loads(snapshot))
+
+
+def _value_fingerprint(value: Any) -> str | None:
+    """Validate bounded plain data before hashing; never invoke object hooks."""
+    nodes = 0
+    size = 0
+    seen: set[int] = set()
+
+    def supported(item: Any, depth: int = 0) -> bool:
+        nonlocal nodes, size
+        nodes += 1
+        if nodes > 1024 or depth > 12:
+            return False
+        kind = type(item)
+        if kind is str:
+            if len(item) > 65536 - size:
+                return False
+            size += len(item.encode("utf-8"))
+        elif any(kind is known for known in (type(None), bool, float)):
+            size += 16
+        elif kind is int:
+            if item.bit_length() > 256:
+                return False
+            size += 80
+        elif any(kind is known for known in (dict, list, tuple)):
+            if id(item) in seen or len(item) > 1024:
+                return False
+            seen.add(id(item))
+            if kind is dict:
+                valid = all(type(key) is str and supported(key, depth + 1) and
+                            supported(child, depth + 1) for key, child in item.items())
+            else:
+                valid = all(supported(child, depth + 1) for child in item)
+            seen.remove(id(item))
+            return valid
+        else:
+            return False
+        return size <= 65536
+
+    try:
+        if not supported(value):
+            return None
+        encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                             separators=(",", ":")).encode("utf-8")
+    except (ValueError, UnicodeError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def project_live_binding(item: dict[str, Any]) -> dict[str, Any]:
+    """Prompt-only projection; canonical descriptors retain validation metadata."""
+    redundant = {"value_fingerprint"}
+    if item.get("module") == "builtins":
+        redundant.add("module")
+    access = item.get("access_expression")
+    if isinstance(access, str) and access.strip():
+        redundant.update(("name", "selector", "inspect_expression"))
+    else:
+        access = item.get("name")
+    kind = item.get("read_value_kind")
+    suffix = {"result": "['data']['text']", "data": "['text']", "text": ""}.get(kind) if isinstance(kind, str) else None
+    content = {}
+    if item.get("read_reference") and suffix is not None and isinstance(access, str) and access.strip():
+        content["content_expression"] = access + suffix
+        # The attested form and exact content locator replace generic container
+        # shape and duplicate locators, not source scope, coverage or origin.
+        redundant.update(("name", "selector", "inspect_expression", "access_expression", "type", "size", "binding_type"))
+    return {**{key: value for key, value in item.items() if key not in redundant}, **content}
+
+
+class _StateProxy:
+    def __init__(
+        self,
+        namespace: Mapping[str, Any],
+        metadata: Mapping[str, Mapping[str, str]],
+    ) -> None:
+        self._namespace = namespace
+        self._metadata = metadata
+        self._sources: dict[int, tuple[Any, str, dict[str, Any], str]] = {}
+        self._reads: dict[str, tuple[dict[str, Any], str, dict[str, Any]]] = {}
+        self._read_handles_by_uri: dict[str, str] = {}
+        self._next_read_handle = 1
+        self._read_descriptions: dict[str, str] = {}
+        self._annotations: dict[tuple[str, tuple[str | int, ...]], tuple[Any, str, str]] = {}
+        self._output_replacements: list[tuple[str, str]] = []
+        self._used_read_handles: set[str] = set()
+
+    def register_read(self, result: Any) -> None:
+        """Called only on a host broker response, before returning it to code."""
+        if type(result) is not dict or result.get("status") != "ok":
+            return
+        retained = result.pop("retained_read_reference", None)
+        reference = result.get("read_reference")
+        data = result.get("data")
+        if type(reference) is not dict or type(data) is not dict or type(data.get("text")) is not str:
+            return
+        if (type(retained) is dict
+                and retained.get("artifact_uri") in self._read_handles_by_uri
+                and all(retained.get(key) == reference.get(key)
+                        for key in ("path", "sha256", "offset", "returned_lines"))):
+            result["read_reference"] = reference = retained
+        # Detach the attestation from all model-mutable result containers.
+        reference = json.loads(json.dumps(reference))
+        uri = reference.get("artifact_uri")
+        if isinstance(uri, str) and uri.startswith("artifact://sha256/"):
+            handle = self._read_handles_by_uri.get(uri)
+            if handle is None:
+                handle = f"read:{self._next_read_handle}"
+                self._next_read_handle += 1
+                self._read_handles_by_uri[uri] = handle
+            result["read_handle"] = handle
+            result_digest = _value_fingerprint(result)
+            if result_digest is None:
+                return
+            self._reads[handle] = (result, result_digest, reference)
+            # ponytail: live-epoch LRU by insertion order; add persistence only if
+            # artifact recovery proves too costly after real worker loss.
+            while len(self._reads) > 64:
+                evicted = next(iter(self._reads))
+                evicted_uri = self._reads.pop(evicted)[2]["artifact_uri"]
+                self._read_handles_by_uri.pop(evicted_uri, None)
+                self._read_descriptions.pop(evicted_uri, None)
+        reuse = result.get("read_reuse")
+        if isinstance(reuse, dict):
+            for prior_uri in reuse.get("reused_artifact_uris", []):
+                prior_handle = self._read_handles_by_uri.get(prior_uri)
+                prior = self._reads.get(prior_handle) if prior_handle else None
+                text = prior[0].get("data", {}).get("text") if prior else None
+                if isinstance(text, str) and len(text.encode()) >= 256:
+                    notice = f"[source already retained as {prior_handle}; use agent.state.reuse({prior_handle!r}) without printing it]"
+                    self._output_replacements.extend(((text, notice), (repr(text), repr(notice))))
+        for value, kind in ((result, "result"), (data, "data"), (data.get("text"), "text")):
+            digest = _value_fingerprint(value)
+            if digest is None:
+                continue
+            self._sources[id(value)] = (value, digest, reference, kind)
+            # ponytail: bounded live-value index, not whole-heap lineage tracking.
+            while len(self._sources) > 128:
+                self._sources.pop(next(iter(self._sources)))
+
+    def start_cell(self) -> None:
+        self._output_replacements.clear()
+        self._used_read_handles.clear()
+
+    def begin_cell(self, assigned_names: set[str]) -> None:
+        for key in tuple(self._annotations):
+            if key[0] in assigned_names:
+                self._annotations.pop(key, None)
+
+    def sanitize_output(self, text: str | None) -> str | None:
+        if text is None:
+            return None
+        for captured, notice in sorted(set(self._output_replacements), key=lambda item: -len(item[0])):
+            text = text.replace(captured, notice)
+        return text
+
+    def cite(self, handle_or_artifact_uri: str) -> str:
+        """Resolve a live read handle to its broker-attested evidence URI."""
+        return str(self.reuse(handle_or_artifact_uri)["read_reference"]["artifact_uri"])
+
+    def annotate(self, name: str, description: str, selector: tuple[str | int, ...] = ()) -> dict[str, Any]:
+        """Describe one current value; the annotation is advisory, not a fact."""
+        try:
+            value = self._resolve(name, selector)
+        except KeyError:
+            return {"status": "unavailable", "reason": "unknown live binding"}
+        if type(description) is not str or not description.strip() or len(description.encode(errors="replace")) > 500:
+            return {"status": "unavailable", "reason": "description must be nonempty and at most 500 UTF-8 bytes"}
+        description = description.encode(errors="replace").decode()
+        key = (name, tuple(selector))
+        digest = _value_fingerprint(value)
+        if digest is None:
+            return {"status": "unavailable", "reason": "value exceeds the supported fingerprint budget"}
+        if key not in self._annotations and len(self._annotations) >= 64:
+            return {"status": "unavailable", "reason": "at most 64 live annotations are supported"}
+        self._annotations[key] = (value, digest, description)
+        source = self._sources.get(id(value))
+        if source and source[0] is value and source[1] == digest:
+            uri = source[2].get("artifact_uri")
+            if isinstance(uri, str) and uri in self._read_handles_by_uri:
+                self._read_descriptions[uri] = description
+        return {"status": "ok", **self.describe(name, selector)}
+
+    def list(self) -> list[dict[str, Any]]:
+        """Return metadata for live bindings without exposing their values."""
+
+        names = sorted(name for name in self._namespace
+                       if not name.startswith("__") and name not in _RESERVED_NAMES)
+        reads: set[tuple[str, tuple[str | int, ...]]] = set()
+        pending: deque[tuple[str, tuple[str | int, ...], Any]] = deque(
+            (name, (), self._namespace[name]) for name in names[:128])
+        seen: set[int] = set()
+        # ponytail: scan 128 roots/512 values, 64 children and eight levels;
+        # use targeted state.describe or rebind nearer values beyond discovery.
+        for _ in range(512):
+            if not pending:
+                break
+            name, selector, value = pending.popleft()
+            if id(value) in seen:
+                continue
+            if id(value) in self._sources:
+                try:
+                    item = self.describe(name, selector)
+                except KeyError:
+                    continue
+                if item.get("read_reference"):
+                    reads.add((name, selector))
+                    seen.add(id(value))
+                    continue  # Do not repeat the same capture's data/text children.
+            if len(selector) >= 8:
+                continue
+            if type(value) is dict:
+                if len(value) > 1024 or any(type(key) is not str and type(key) is not int for key in value):
+                    continue
+                children = islice(value.items(), 64)
+            elif type(value) is list or type(value) is tuple:
+                children = enumerate(value[:64])
+            else:
+                continue
+            seen.add(id(value))
+            for key, child in children:
+                if len(pending) >= 512:
+                    break
+                if ((type(key) is str and len(key.encode(errors="replace")) > 128)
+                        or (type(key) is int and key.bit_length() > 256)):
+                    continue
+                pending.append((name, (*selector, key), child))
+        keys = sorted(set((name, ()) for name in names) | set(self._annotations) | reads,
+                      key=lambda key: (key not in self._annotations, key not in reads, key[0], json.dumps(key[1])))
+        result = []
+        for name, selector in keys[:64]:
+            try:
+                result.append(self.describe(name, selector))
+            except KeyError:
+                self._annotations.pop((name, selector), None)
+                result.append({"name": name, "selector": list(selector), "availability": "unavailable"})
+        retained = self.reads()
+        ordinary = [item for item in result if not item.get("read_reference")]
+        ordinary.sort(key=lambda item: (not bool(item.get("description")), item.get("name", "")))
+        combined = [*retained, *ordinary]
+        combined.sort(key=lambda item: (not bool(item.get("description")),
+                                        not bool(item.get("read_reference"))))
+        return combined[:64]
+
+    def reads(self, path: str | None = None) -> list[dict[str, Any]]:
+        """List stable access recipes for broker-attested reads in this live epoch."""
+        if path is not None and (type(path) is not str or not path):
+            raise ValueError("path must be a nonempty string or None")
+        entries = []
+        for handle, (value, digest, reference) in tuple(self._reads.items()):
+            uri = reference["artifact_uri"]
+            if _value_fingerprint(value) != digest:
+                self._reads.pop(handle, None)
+                self._read_handles_by_uri.pop(uri, None)
+                self._read_descriptions.pop(uri, None)
+                continue
+            if path is not None and reference.get("path") != path:
+                continue
+            access = f"agent.state.reuse({handle!r})"
+            entries.append({
+                "name": "agent.state.reuse", "selector": [handle], "handle": handle,
+                "access_expression": access,
+                "inspect_expression": f"agent.state.reads(path={reference.get('path')!r})",
+                "type": "dict", "read_value_kind": "result",
+                "availability": "live_retained_read", "freshness": "historical_snapshot",
+                "read_reference": json.loads(json.dumps(reference)),
+                "value_fingerprint": digest,
+                **({"description": self._read_descriptions[uri], "description_authority": "advisory"}
+                   if uri in self._read_descriptions else {}),
+            })
+        return entries
+
+    def reuse(self, handle_or_artifact_uri: str) -> dict[str, Any]:
+        """Return an unchanged broker-attested read retained in this live epoch."""
+        if type(handle_or_artifact_uri) is not str:
+            raise KeyError("unknown retained read")
+        handle = self._read_handles_by_uri.get(handle_or_artifact_uri, handle_or_artifact_uri)
+        retained = self._reads.get(handle)
+        if retained is None or _value_fingerprint(retained[0]) != retained[1]:
+            self._reads.pop(handle, None)
+            uri = retained[2].get("artifact_uri") if retained else handle_or_artifact_uri
+            if isinstance(uri, str):
+                self._read_handles_by_uri.pop(uri, None)
+                self._read_descriptions.pop(uri, None)
+            raise KeyError("unknown retained read")
+        self._used_read_handles.add(handle)
+        return retained[0]
+
+    def used_read_handles(self) -> tuple[str, ...]:
+        return tuple(sorted(self._used_read_handles))
+
+    def _resolve(self, name: str, selector: tuple[str | int, ...]) -> Any:
+        if type(name) is not str or not name.isidentifier() or name.startswith("__") or name in _RESERVED_NAMES:
+            raise KeyError("unknown state binding")
+        if (type(selector) is not list and type(selector) is not tuple) or len(selector) > 8 or any(
+            type(key) is not str and type(key) is not int for key in selector
+        ):
+            raise KeyError("selector must be at most eight string/integer keys")
+        if any((type(key) is str and len(key.encode(errors="replace")) > 4096) or
+               (type(key) is int and key.bit_length() > 256) for key in selector):
+            raise KeyError("selector key exceeds its bounded representation")
+        try:
+            value = self._namespace[name]
+            for key in selector:
+                if type(value) is dict and (len(value) > 1024 or any(type(existing) is not str and type(existing) is not int for existing in value)):
+                    raise KeyError("selector requires bounded plain keys")
+                if type(value) is dict:
+                    value = value[key]
+                elif (type(value) is list or type(value) is tuple) and type(key) is int and key >= 0:
+                    value = value[int(key)]
+                else:
+                    raise KeyError("selector requires a plain container")
+        except (KeyError, IndexError) as error:
+            raise KeyError(f"unknown state binding: {name}") from error
+        return value
+
+    def describe(self, name: str, selector: tuple[str | int, ...] = (), *, preview: bool = False) -> dict[str, Any]:
+        """Describe one live value using only plain-container selectors."""
+        if not selector and name in self._reads:
+            descriptor = next(item for item in self.reads() if item.get("handle") == name)
+            if preview:
+                value = self._reads[name][0]
+                descriptor["preview"] = {
+                    "keys": [key[:80] for key in islice(value, 8) if type(key) is str]
+                }
+            return descriptor
+        value = self._resolve(name, selector)
+        key = (name, tuple(selector))
+        item = _binding_description(name, value, self._metadata)
+        if preview:
+            if type(value) is str:
+                item["preview"] = value[:256].encode(errors="replace").decode()
+                item["preview_truncated"] = len(value) > 256
+            elif type(value) is dict:
+                item["preview"] = {"keys": [key[:80] for key in islice(value, 8) if type(key) is str]}
+            elif type(value) is list or type(value) is tuple:
+                item["preview"] = {"item_types": [
+                    type(child).__name__ if type(type(child)) is type else "object"
+                    for child in value[:8]
+                ]}
+        if selector:
+            item["selector"] = list(selector)
+            item["binding_type"] = _binding_description(name, self._namespace[name], self._metadata)["type"]
+            item["access_expression"] = name + "".join(f"[{part!r}]" for part in selector)
+            item["inspect_expression"] = f"agent.state.describe({name!r}, selector={tuple(selector)!r}, preview=True)"
+        source = self._sources.get(id(value))
+        annotation = self._annotations.get(key)
+        digest = _value_fingerprint(value) if source or annotation else None
+        if source:
+            if source[0] is value and digest is not None and source[1] == digest:
+                item["read_reference"] = json.loads(json.dumps(source[2]))
+                item["read_value_kind"] = source[3]
+                item["freshness"] = "historical_snapshot"
+            else:
+                self._sources.pop(id(value), None)
+                item["provenance"] = "invalidated"
+        if annotation:
+            if annotation[0] is value and digest is not None and annotation[1] == digest:
+                item["description"] = annotation[2]
+                item["description_authority"] = "advisory"
+            else:
+                self._annotations.pop(key, None)
+                item["description_status"] = "invalidated"
+        if source or annotation:
+            item["value_fingerprint"] = digest
+        return item
+
+
+def _agent_proxy(
+    connection: Connection,
+    namespace: Mapping[str, Any],
+    metadata: Mapping[str, Mapping[str, str]],
+    help_catalog: Mapping[str, Mapping[str, object]],
+    state: _StateProxy,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        help=lambda prefix=None, *, details=False: _agent_help(
+            help_catalog, prefix, details=details
+        ),
+        parallel=_RemoteOperation(connection, "parallel", state).__call__,
+        fs=SimpleNamespace(
+            read=_RemoteOperation(connection, "fs.read", state).__call__,
+            write=_RemoteOperation(connection, "fs.write"),
+            edit=_RemoteOperation(connection, "fs.edit"),
+        ),
+        shell=SimpleNamespace(run=_RemoteOperation(connection, "shell.run")),
+        mcp=SimpleNamespace(call=_RemoteOperation(connection, "mcp.call")),
+        artifacts=SimpleNamespace(
+            load=_RemoteOperation(connection, "artifacts.load"),
+            list=_RemoteOperation(connection, "artifacts.list"),
+            publish=_RemoteOperation(connection, "artifacts.publish"),
+        ),
+        state=SimpleNamespace(list=state.list, reads=state.reads, reuse=state.reuse, cite=state.cite,
+                              describe=state.describe, annotate=state.annotate),
+    )
+
+
+def _bound_names(tree: ast.AST) -> set[str]:
+    names = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+    return names
+
+
+def _execute_cell(
+    code: str,
+    namespace: dict[str, Any],
+    *,
+    max_output_bytes: int,
+    cell_id: str = "unknown",
+    replay_policy: str = "transient",
+    state_metadata: dict[str, dict[str, str]] | None = None,
+    state_recovery: str = "replay_safe",
+    snapshot_max_bytes: int = 1_000_000,
+    state_catalog: _StateProxy | None = None,
+    capture_committed: bool = False,
+    helper_contract: dict | None = None,
+) -> dict[str, Any]:
+    prior_names = set(namespace)
+    stdout = _BoundedText(max_output_bytes)
+    stderr = _BoundedText(max_output_bytes)
+    failure_stage: Literal["parse", "source_validation", "execution"] = "parse"
+    annotation_checkpoint = dict(state_catalog._annotations) if state_catalog is not None else None
+    read_description_checkpoint = dict(state_catalog._read_descriptions) if state_catalog is not None else None
+    snapshot = (
+        _snapshot_namespace(namespace, snapshot_max_bytes)
+        if state_recovery == "snapshot"
+        else None
+    )
+    source_name = "<agent-cell>"
+    if state_catalog is not None:
+        state_catalog.start_cell()
+    try:
+        # Source identity distinguishes frames from functions retained out of an
+        # earlier cell, including callers that use the default cell_id="unknown".
+        source_name = f"<agent-cell:{hashlib.sha256(code.encode('utf-8', errors='surrogatepass')).hexdigest()}>"
+        tree = ast.parse(code, filename=source_name, mode="exec")
+        failure_stage = "source_validation"
+        _validate_source(tree)
+        if helper_contract:
+            from .preflight import validate
+            validate(tree, namespace, helper_contract)
+        failure_stage = "execution"
+        touched_names = _bound_names(tree)
+        if state_catalog is not None:
+            state_catalog.begin_cell(touched_names)
+        final_expression: ast.expr | None = None
+        if tree.body:
+            last_statement = tree.body[-1]
+            if isinstance(last_statement, ast.Expr):
+                final_expression = last_statement.value
+                tree.body.pop()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            if tree.body:
+                exec(compile(tree, source_name, "exec"), namespace)
+            value = (
+                eval(compile(ast.Expression(final_expression), source_name, "eval"), namespace)
+                if final_expression is not None
+                else None
+            )
+        display_data = (
+            value
+            if isinstance(value, dict)
+            and value
+            and all(isinstance(key, str) and "/" in key for key in value)
+            else None
+        )
+        value_repr = None if value is None or display_data is not None else (repr(value) if _snapshot_value(value, set()) else f"<{type(value).__name__}; inspect explicitly>")
+        full_value_repr = value_repr
+        if full_value_repr is not None and len(full_value_repr.encode()) > 256_000:
+            original_bytes = len(full_value_repr.encode())
+            full_value_repr = full_value_repr.encode()[:256_000].decode(errors='ignore') + f"\n[retention truncated: original {original_bytes} bytes; suffix unavailable]"
+        if value_repr is not None and len(value_repr.encode()) > max_output_bytes:
+            value_repr = value_repr.encode()[:max_output_bytes].decode(errors="ignore")
+            stdout.truncated = True
+        metadata = state_metadata if state_metadata is not None else {}
+        for name in touched_names:
+            if name in namespace and not name.startswith("__") and name not in _RESERVED_NAMES:
+                metadata[name] = {"cell_id": cell_id, "replay": replay_policy}
+            else:
+                metadata.pop(name, None)
+        manifest = state_catalog.list() if state_catalog is not None else _state_manifest(namespace, metadata)
+        checkpoint_values, checkpoint_omitted = (
+            _plain_checkpoint(namespace, snapshot_max_bytes) if capture_committed else (None, ())
+        )
+        selected_stdout = state_catalog.sanitize_output(stdout.getvalue()) if state_catalog else stdout.getvalue()
+        selected_full_stdout = state_catalog.sanitize_output(stdout.full_value()) if state_catalog else stdout.full_value()
+        value_repr = state_catalog.sanitize_output(value_repr) if state_catalog else value_repr
+        return {
+            "status": "ok",
+            "stdout": selected_stdout,
+            "stderr": stderr.getvalue(),
+            "full_stdout": selected_full_stdout,
+            "full_stderr": stderr.full_value(),
+            "value_repr": value_repr,
+            "full_value_repr": state_catalog.sanitize_output(full_value_repr) if state_catalog else full_value_repr,
+            "display_data": display_data,
+            "output_truncated": stdout.truncated or stderr.truncated,
+            "state_count": sum(not name.startswith("__") and name not in _RESERVED_NAMES for name in namespace),
+            "state_delta": sorted(name for name in touched_names if name in namespace),
+            "state_deleted": sorted(prior_names - set(namespace)),
+            "state_manifest": manifest[:64],
+            "retained_read_uses": state_catalog.used_read_handles() if state_catalog else (),
+            "checkpoint_values": checkpoint_values,
+            "checkpoint_omitted_names": checkpoint_omitted,
+        }
+    except BaseException as error:
+        if state_catalog is not None and annotation_checkpoint is not None:
+            state_catalog._annotations = annotation_checkpoint
+            assert read_description_checkpoint is not None
+            state_catalog._read_descriptions = read_description_checkpoint
+        state_preserved = snapshot is not None and failure_stage == "execution"
+        if state_preserved:
+            assert snapshot is not None
+            _restore_snapshot(namespace, snapshot)
+        # Runtime exceptions such as JSONDecodeError use lineno for their input
+        # data, not this cell. Only our parser/source guard owns a source lineno.
+        error_line = (getattr(error, "lineno", None) if failure_stage != "execution" else None) or next(
+            (
+                frame.lineno
+                for frame in reversed(traceback.extract_tb(error.__traceback__))
+                if frame.filename == source_name
+            ),
+            None,
+        )
+        lines = code.splitlines()
+        selected_stdout = state_catalog.sanitize_output(stdout.getvalue()) if state_catalog else stdout.getvalue()
+        selected_full_stdout = state_catalog.sanitize_output(stdout.full_value()) if state_catalog else stdout.full_value()
+        return {
+            "status": "error",
+            "stdout": selected_stdout,
+            "stderr": stderr.getvalue(),
+            "full_stdout": selected_full_stdout,
+            "full_stderr": stderr.full_value(),
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "failure_stage": failure_stage,
+            "error_line": error_line,
+            "error_source": (
+                lines[error_line - 1].strip()
+                if error_line is not None and 0 < error_line <= len(lines)
+                else None
+            ),
+            "traceback": tuple(traceback.format_exception_only(error)),
+            "state_preserved": state_preserved,
+            "state_deleted": sorted(prior_names - set(namespace)),
+            "retained_read_uses": state_catalog.used_read_handles() if state_catalog else (),
+            "output_truncated": stdout.truncated or stderr.truncated,
+        }
+
+
+def _worker_main(
+    connection: Connection,
+    max_output_bytes: int,
+    help_catalog: Mapping[str, Mapping[str, object]],
+    state_recovery: str,
+    snapshot_max_bytes: int,
+    capture_committed: bool,
+    helper_contract: dict | None,
+) -> None:
+    namespace: dict[str, Any] = {
+        "__builtins__": _safe_builtins(),
+        "__name__": "__agent_repl__",
+    }
+    state_metadata: dict[str, dict[str, str]] = {}
+    for name in _PRELOADED_MODULES:
+        namespace[name] = importlib.import_module(name)
+    state_catalog = _StateProxy(namespace, state_metadata)
+    namespace["agent"] = _agent_proxy(connection, namespace, state_metadata, help_catalog, state_catalog)
+    namespace.update({
+        "read": _DirectOperation(connection, "fs.read", state_catalog),
+        "write": _DirectOperation(connection, "fs.write"),
+        "edit": _DirectOperation(connection, "fs.edit"),
+        "bash": _DirectOperation(connection, "shell.run"),
+        "verify": _DirectOperation(connection, "verify"),
+    })
+    while True:
+        try:
+            request = connection.recv()
+        except EOFError:
+            return
+        if request.get("type") == "close":
+            return
+        if request.get("type") == "restore_plain":
+            values = request.get("values")
+            source_cell_id = request.get("source_cell_id")
+            valid = (type(values) is dict and type(source_cell_id) is str and
+                     all(type(name) is str and not name.startswith("__") and
+                         name not in _RESERVED_NAMES and _checkpoint_value(value, set())
+                         for name, value in values.items()))
+            if valid:
+                try:
+                    valid = len(json.dumps(values, sort_keys=True, separators=(",", ":"),
+                                           ensure_ascii=False, allow_nan=False).encode()) <= snapshot_max_bytes
+                except (TypeError, ValueError, OverflowError):
+                    valid = False
+            if not valid:
+                connection.send({"type": "restore_result", "id": request.get("id"),
+                                 "ok": False, "error": "invalid or oversized plain checkpoint"})
+                continue
+            for name in tuple(namespace):
+                if not name.startswith("__") and name not in _RESERVED_NAMES:
+                    del namespace[name]
+            state_metadata.clear()
+            namespace.update(values)
+            state_metadata.update({name: {"cell_id": source_cell_id, "replay": "committed_checkpoint"}
+                                   for name in values})
+            connection.send({"type": "restore_result", "id": request.get("id"),
+                             "ok": True, "state_manifest": [state_catalog.describe(name)
+                                                            for name in sorted(values)]})
+            continue
+        if request.get("type") != "execute":
+            continue
+        result = _execute_cell(
+            str(request.get("code", "")),
+            namespace,
+            max_output_bytes=max_output_bytes,
+            cell_id=str(request.get("cell_id", "unknown")),
+            replay_policy=str(request.get("replay_policy", "transient")),
+            state_metadata=state_metadata,
+            state_recovery=state_recovery,
+            snapshot_max_bytes=snapshot_max_bytes,
+            state_catalog=state_catalog,
+            capture_committed=capture_committed,
+            helper_contract=helper_contract,
+        )
+        connection.send({"type": "execution_result", "id": request.get("id"), **result})
+
+
+def default_help_catalog() -> dict[str, dict[str, object]]:
+    """Return the deterministic built-in capability and kernel catalog."""
+
+    catalog = {
+        name: {
+            "signature": signature,
+            "result": _AGENT_RESULTS.get(name, {}),
+        }
+        for name, signature in _AGENT_HELP.items()
+    }
+    catalog["kernel"] = {
+        "description": "Persistent CPython computation environment",
+        "python": platform.python_version(),
+        "preloaded_modules": list(_PRELOADED_MODULES),
+        "workspace_execution": WORKSPACE_EXECUTION_GUIDANCE,
+        "blocked_direct_calls": sorted(_BLOCKED_CALLS),
+        "blocked_direct_modules": sorted(_BLOCKED_MODULES),
+    }
+    return catalog
+
+
+class PersistentPythonWorker:
+    """Own one restartable CPython subprocess and its durable-in-process namespace."""
+
+    def __init__(
+        self,
+        *,
+        max_output_bytes: int = 64_000,
+        help_catalog: Mapping[str, Mapping[str, object]] | None = None,
+        state_recovery: str = "replay_safe",
+        snapshot_max_bytes: int = 1_000_000,
+        capture_committed: bool = False,
+        helper_contract: dict | None = None,
+    ) -> None:
+        if max_output_bytes < 1_024:
+            raise ValueError("max_output_bytes must be at least 1024")
+        self.max_output_bytes = max_output_bytes
+        self.help_catalog = {
+            name: dict(item)
+            for name, item in sorted((help_catalog or default_help_catalog()).items())
+        }
+        if state_recovery not in {"replay_safe", "snapshot"}:
+            raise ValueError("state_recovery must be replay_safe or snapshot")
+        self.state_recovery = state_recovery
+        self.snapshot_max_bytes = snapshot_max_bytes
+        self.capture_committed = capture_committed
+        self.helper_contract = helper_contract
+        self._process: BaseProcess | None = None
+        self._connection: Connection | None = None
+        self._kernel_epoch: str | None = None
+        self._lock = threading.Lock()
+
+    def _start(self) -> None:
+        if self._process is not None and self._process.is_alive():
+            return
+        self._discard()
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_worker_main,
+            args=(
+                child,
+                self.max_output_bytes,
+                self.help_catalog,
+                self.state_recovery,
+                self.snapshot_max_bytes,
+                self.capture_committed,
+                self.helper_contract,
+            ),
+            daemon=True,
+            name="agent-cpython-worker",
+        )
+        process.start()
+        child.close()
+        self._connection = parent
+        self._process = process
+        self._kernel_epoch = uuid4().hex
+
+    def _discard(self) -> None:
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        self._kernel_epoch = None
+        if connection is not None:
+            connection.close()
+        if process is not None:
+            if process.is_alive():
+                process.kill()
+            process.join(timeout=1)
+
+    @property
+    def kernel_epoch(self) -> str:
+        """Return the current worker lifetime, starting the worker when needed."""
+
+        with self._lock:
+            self._start()
+            assert self._kernel_epoch is not None
+            return self._kernel_epoch
+
+    def kernel_status(self) -> dict[str, Any]:
+        """Describe the current worker without starting or resetting it."""
+        with self._lock:
+            live = self._process is not None and self._process.is_alive()
+            return {"live": live, "kernel_epoch": self._kernel_epoch if live else None}
+
+    @staticmethod
+    def _broker_operation(broker: ReplBroker, operation: str) -> Callable[..., Any]:
+        names: Mapping[str, str] = {
+            "fs.read": "read",
+            "fs.write": "write",
+            "fs.edit": "edit",
+            "shell.run": "bash",
+            "verify": "verify",
+            "mcp.call": "call",
+            "parallel": "parallel",
+            "artifacts.load": "artifacts_load",
+            "artifacts.list": "artifacts_list",
+            "artifacts.publish": "artifacts_publish",
+        }
+        name = names.get(operation)
+        if name is None:
+            raise ValueError(f"unsupported broker operation: {operation}")
+        candidate = getattr(broker, name, None)
+        if not callable(candidate):
+            raise TypeError(f"broker does not implement {name}")
+        return candidate
+
+    def execute(
+        self,
+        code: str,
+        broker: ReplBroker,
+        timeout_seconds: float = 120,
+        *,
+        cell_id: str = "unknown",
+        replay_policy: str = "transient",
+        shell_timeout_margin: float | None = None,
+    ) -> PythonExecutionResult:
+        if not isinstance(code, str):
+            raise TypeError("code must be a string")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        with self._lock:
+            self._start()
+            assert self._connection is not None
+            request_id = uuid4().hex
+            try:
+                self._connection.send(
+                    {
+                        "type": "execute",
+                        "id": request_id,
+                        "code": code,
+                        "cell_id": cell_id,
+                        "replay_policy": replay_policy,
+                    }
+                )
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._connection.poll(min(remaining, 0.05)):
+                        if remaining > 0:
+                            continue
+                        self._discard()
+                        return PythonExecutionResult(
+                            status="timeout",
+                            error_type="TimeoutError",
+                            error_message="Python execution timed out; worker state was discarded",
+                            duration_ms=int((time.monotonic() - started) * 1_000),
+                            effect_unknown=True,
+                            failure_stage="execution",
+                        )
+                    response = self._connection.recv()
+                    if response.get("type") == "broker_call":
+                        if shell_timeout_margin is not None and response.get("operation") in {"shell.run", "verify"}:
+                            args = response.get("args", ())
+                            budget = response.get("kwargs", {}).get("timeout_seconds", args[1] if len(args) > 1 else 120)
+                            if type(budget) is int and 1 <= budget <= 600:
+                                deadline = max(deadline, time.monotonic() + budget + shell_timeout_margin)
+                        replies: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+
+                        def invoke_broker(
+                            request: dict[str, Any] = response,
+                            output: queue.Queue[dict[str, Any]] = replies,
+                        ) -> None:
+                            try:
+                                operation = self._broker_operation(
+                                    broker, str(request.get("operation", ""))
+                                )
+                                result = operation(
+                                    *tuple(request.get("args", ())),
+                                    **dict(request.get("kwargs", {})),
+                                )
+                                output.put(
+                                    {
+                                        "type": "broker_result",
+                                        "id": request.get("id"),
+                                        "ok": True,
+                                        "result": result,
+                                    }
+                                )
+                            except BaseException as error:
+                                output.put(
+                                    {
+                                        "type": "broker_result",
+                                        "id": request.get("id"),
+                                        "ok": False,
+                                        "error": f"{type(error).__name__}: {error}",
+                                    }
+                                )
+
+                        threading.Thread(
+                            target=invoke_broker,
+                            daemon=True,
+                            name="agent-broker-call",
+                        ).start()
+                        try:
+                            reply = replies.get(timeout=max(deadline - time.monotonic(), 0))
+                        except queue.Empty:
+                            self._discard()
+                            return PythonExecutionResult(
+                                status="timeout",
+                                error_type="TimeoutError",
+                                error_message=(
+                                    "Python execution timed out during a broker call; "
+                                    "worker state was discarded and reconciliation is required"
+                                ),
+                                duration_ms=int((time.monotonic() - started) * 1_000),
+                                effect_unknown=True,
+                                failure_stage="execution",
+                            )
+                        if shell_timeout_margin is not None and response.get("operation") in {"shell.run", "verify"}:
+                            # Each returned shell call leaves a fresh bounded Python budget.
+                            deadline = time.monotonic() + timeout_seconds
+                        self._connection.send(reply)
+                        continue
+                    if (
+                        response.get("type") != "execution_result"
+                        or response.get("id") != request_id
+                    ):
+                        raise RuntimeError("invalid worker response")
+                    return PythonExecutionResult(
+                        status=response["status"],
+                        stdout=response.get("stdout", ""),
+                        stderr=response.get("stderr", ""),
+                        full_stdout=response.get("full_stdout"),
+                        full_stderr=response.get("full_stderr"),
+                        value_repr=response.get("value_repr"),
+                        full_value_repr=response.get("full_value_repr"),
+                        display_data=response.get("display_data"),
+                        error_type=response.get("error_type"),
+                        error_message=response.get("error_message"),
+                        failure_stage=response.get("failure_stage"),
+                        error_line=response.get("error_line"),
+                        error_source=response.get("error_source"),
+                        traceback=tuple(response.get("traceback", ())),
+                        duration_ms=int((time.monotonic() - started) * 1_000),
+                        output_truncated=bool(response.get("output_truncated", False)),
+                        state_count=int(response.get("state_count", 0)),
+                        state_delta=tuple(str(name) for name in response.get("state_delta", ())),
+                        state_deleted=tuple(response.get("state_deleted", ())),
+                        state_manifest=tuple(response.get("state_manifest", ())),
+                        retained_read_uses=tuple(
+                            str(handle) for handle in response.get("retained_read_uses", ())
+                        ),
+                        state_preserved=bool(response.get("state_preserved", False)),
+                        checkpoint_values=response.get("checkpoint_values"),
+                        checkpoint_omitted_names=tuple(response.get("checkpoint_omitted_names", ())),
+                    )
+            except (EOFError, BrokenPipeError, OSError) as error:
+                self._discard()
+                return PythonExecutionResult(
+                    status="error",
+                    error_type=type(error).__name__,
+                    error_message="Python worker exited unexpectedly; worker state was discarded",
+                    duration_ms=int((time.monotonic() - started) * 1_000),
+                    effect_unknown=True,
+                    failure_stage="transport",
+                )
+
+    def restore_plain(self, values: dict[str, Any], source_cell_id: str) -> tuple[dict[str, Any], ...]:
+        """Restore only validated, previously committed plain values into a fresh worker."""
+        with self._lock:
+            self._start()
+            assert self._connection is not None
+            request_id = uuid4().hex
+            self._connection.send({"type": "restore_plain", "id": request_id,
+                                   "values": values, "source_cell_id": source_cell_id})
+            if not self._connection.poll(30):
+                self._discard()
+                raise RuntimeError("plain checkpoint restore timed out")
+            response = self._connection.recv()
+            if (response.get("type") != "restore_result" or response.get("id") != request_id
+                    or not response.get("ok")):
+                self._discard()
+                raise ValueError("plain checkpoint restore identity or content mismatch")
+            return tuple(response.get("state_manifest", ()))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._connection is not None and self._process is not None:
+                try:
+                    self._connection.send({"type": "close"})
+                    self._process.join(timeout=1)
+                except (BrokenPipeError, OSError):
+                    pass
+            self._discard()
+
+    def reset(self) -> None:
+        """Discard the current namespace after an uncommitted cell failure."""
+
+        with self._lock:
+            self._discard()
+
+    def __enter__(self) -> PersistentPythonWorker:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+__all__ = [
+    "PersistentPythonWorker",
+    "PythonExecutionResult",
+    "ReplBroker",
+    "default_help_catalog",
+]
