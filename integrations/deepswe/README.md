@@ -102,8 +102,10 @@ run the inspection commands individually (`tail -f` keeps following the log):
 job=skein-kombu-001
 base=/home/ec2-user/e968720/deepswe-eval/jobs/$job
 tail -f "$base/job.log"                 # Pier progress and verifier startup
-find "$base" -path '*/agent/pi-events.jsonl' -exec wc -l {} \;  # Pi activity
-find "$base" -path '*/artifacts/model.patch' -exec wc -c {} \;  # committed patch
+for trial in "$base"/*; do
+  test ! -f "$trial/agent/pi-events.jsonl" || wc -l "$trial/agent/pi-events.jsonl"
+  test ! -f "$trial/artifacts/model.patch" || wc -c "$trial/artifacts/model.patch"
+done                                    # Pi activity and committed patch
 cat "$base/result.json"                  # final scores after completion
 ```
 
