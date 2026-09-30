@@ -94,20 +94,18 @@ pilot and inspect the collected patch and verifier output before scaling up.
 
 ## Monitor from Codex or a local terminal
 
-Ask Codex for the status of your named job, or run `ssh sandbox` in Codex's
-terminal and inspect the files directly. Substitute the actual job name and
-run the inspection commands individually (`tail -f` keeps following the log):
+Ask Codex for the status of your named job, or run the live status reader from
+Codex's terminal. It summarizes the Pi events, recent code cells, patch size,
+and final reward. Substitute the actual job name:
 
 ```bash
-job=skein-kombu-001
-base=/home/ec2-user/e968720/deepswe-eval/jobs/$job
-tail -f "$base/job.log"                 # Pier progress and verifier startup
-for trial in "$base"/*; do
-  test ! -f "$trial/agent/pi-events.jsonl" || wc -l "$trial/agent/pi-events.jsonl"
-  test ! -f "$trial/artifacts/model.patch" || wc -c "$trial/artifacts/model.patch"
-done                                    # Pi activity and committed patch
-cat "$base/result.json"                  # final scores after completion
+ssh sandbox '/home/ec2-user/.venvs/pier/bin/python /home/ec2-user/e968720/pi-skein/integrations/deepswe/status-run.py skein-kombu-001'
 ```
+
+Run it again for an updated snapshot. Pier's `job.log` and redirected terminal
+log may stay empty while Pi is working; `agent/pi-events.jsonl` is the live
+source. After completion, inspect `jobs/<job-name>/result.json` and the
+trial's `verifier/` files for the grade.
 
 For background runs, `screen -ls` shows the session and
 `screen -r <session-name>` attaches to its live terminal. The `agent/`
